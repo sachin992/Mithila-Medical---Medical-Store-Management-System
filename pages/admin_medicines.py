@@ -1,5 +1,5 @@
 import streamlit as st
-from b import execute_custom_query, llm_with_tools
+from backend import execute_custom_query, llm_with_tools
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 
 # ================ PAGE CONFIG ================

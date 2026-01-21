@@ -1,246 +1,262 @@
+
+
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage , SystemMessage, ToolMessage, BaseMessage
-from langgraph.graph import StateGraph , START , END
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    BaseMessage,
+    AIMessage,
+)
+from langgraph.graph import StateGraph, START, END
 from langchain_core.tools import tool
-from typing import TypedDict, Annotated, Optional, Dict, List
+from typing import TypedDict, Annotated, Optional, List
 from urllib.parse import quote_plus
 import sqlite3
-from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
-from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_community.utilities import SQLDatabase 
+from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
-from langgraph.channels import LastValue
+import pymysql
+
 load_dotenv()
 
-llm=ChatOpenAI(
+# ================ LLM ================
+llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.2
 )
 
-
+# ================ DB (Store Database) ================
 user = "Sachin"
 password = "Sadpli@123"
 host = "localhost"
 port = 3306
 database = "store"
-# Encode the password (important if it has @ or other special chars)
+
 encoded_password = quote_plus(password)
 db_uri = f"mysql+pymysql://{user}:{encoded_password}@{host}:{port}/{database}?charset=utf8mb4"
 db = SQLDatabase.from_uri(db_uri)
 
-
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-SQLTOOL = toolkit.get_tools()
+tools = toolkit.get_tools()
+tools_by_name = {t.name: t for t in tools}
+llm_with_tools = llm.bind_tools(tools)
 
-# for tool in tools:
-#     print(f"> {tool.name}: {tool.description}")
+# ================ CUSTOM QUERY EXECUTOR ================
+def execute_custom_query(query: str):
+    """Execute custom SQL queries for frontend operations"""
+    try:
+        connection = pymysql.connect(
+            host=host,
+            user=user,
+            password=password,
+            database=database,
+            charset='utf8mb4'
+        )
+        cursor = connection.cursor()
+        cursor.execute(query)
+        
+        if query.strip().upper().startswith('SELECT'):
+            results = cursor.fetchall()
+            connection.close()
+            return results
+        else:
+            connection.commit()
+            connection.close()
+            return True
+    except Exception as e:
+        print(f"Database Error: {str(e)}")
+        raise e
 
-
+# ================ STATE ================
 class ChatState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     action_type: Optional[str]
     action_payload: Optional[dict]
+    user_id: Optional[str]
 
-
-
-
-tools=SQLTOOL
-
-llm_with_tools=llm.bind_tools(tools)
-tools_by_name={tool.name:tool for tool in tools}
-
-
-SYSTEM_PROMPT=SYSTEM_PROMPT = """You are a SQL agent for a medical store management system.
+# ================ SYSTEM PROMPT ================
+SYSTEM_PROMPT = """
+You are a Staff Support Agent for a medical store management system. Help staff members query inventory and order data quickly.
 
 DATABASE SCHEMA (MySQL):
-• medicines: medicine_id (PK, AUTO_INCREMENT), medicine_name (NOT NULL), category, manufacturer, description_text, price (NOT NULL), created_at (TIMESTAMP)
-• inventory: inventory_id (PK, AUTO_INCREMENT), medicine_id (FK, NOT NULL), quantity (NOT NULL), batch_number, expiry_date, last_updated (TIMESTAMP)
-• sales: sales_id (PK, AUTO_INCREMENT), medicine_id (FK, NOT NULL), quantity_sold (NOT NULL), price_per_unit (NOT NULL), total_price (NOT NULL), sale_date (DATETIME NOT NULL)
+• medicines: medicine_id (PK, AUTO_INCREMENT), medicine_name (NOT NULL), quantity (NOT NULL, DEFAULT 0), price (DECIMAL), description (TEXT), category (VARCHAR), manufacturer (VARCHAR), expiry_date (DATE), created_at (TIMESTAMP)
+• orders: order_id (PK, AUTO_INCREMENT), user_id (INT, NOT NULL), medicine_id (FK, NOT NULL), quantity (INT, NOT NULL), customer_name (VARCHAR), phone (VARCHAR), address (TEXT), city (VARCHAR), pincode (VARCHAR), status (ENUM: 'Pending', 'Processing', 'Delivered', 'Cancelled'), total_price (DECIMAL), payment_method (VARCHAR), created_at (TIMESTAMP), delivery_date (DATE)
 
-IMPORTANT: Use exact column names - 'categroy' (not category), 'description_text' (not description), 'sales_id' (not sale_id), 'expiry_date' (not expiry_data)
+IMPORTANT COLUMN NAMES:
+• Use exact column names: medicine_name, quantity, price, description, category, manufacturer, expiry_date
+• Order columns: order_id, user_id, medicine_id, customer_name, phone, address, city, pincode, status, total_price, payment_method, delivery_date
 
 BASIC RULES:
 • Use database tools for all SQL operations
-• SELECT: always allowed | INSERT/UPDATE: only when explicitly asked | DELETE: never allowed
+• SELECT queries: always allowed for staff support
+• INSERT/UPDATE: only when staff explicitly requests to add/update medicines or process orders
+• DELETE: never allowed
 • Always JOIN medicines table to show medicine_name in results
 • Use LIKE '%%' for partial name matching (case-insensitive)
+• Default sorting: most recent first for orders
 
-QUERYING DATA:
-Example: "Show Paracetamol inventory"
-→ SELECT m.medicine_name, i.quantity, i.batch_number, i.expiry_date FROM medicines m JOIN inventory i ON m.medicine_id = i.medicine_id WHERE m.medicine_name LIKE '%Paracetamol%'
+STAFF QUERY EXAMPLES:
 
-Example: "Show recent sales"
-→ SELECT m.medicine_name, s.quantity_sold, s.total_price, s.sale_date FROM medicines m JOIN sales s ON m.medicine_id = s.medicine_id ORDER BY s.sale_date DESC LIMIT 10
+1. INVENTORY QUERIES:
+   - "Show low stock medicines" → SELECT medicine_name, quantity, price FROM medicines WHERE quantity < 20 ORDER BY quantity ASC
+   - "What's the stock of Paracetamol?" → SELECT medicine_name, quantity, expiry_date FROM medicines WHERE medicine_name LIKE '%Paracetamol%'
+   - "Show medicines expiring soon" → SELECT medicine_name, expiry_date, quantity FROM medicines WHERE expiry_date < DATE_ADD(CURDATE(), INTERVAL 30 DAY) ORDER BY expiry_date ASC
+   - "List all medicines by category" → SELECT category, medicine_name, quantity, price FROM medicines ORDER BY category
 
-ADDING MEDICINE (Without Inventory):
-1. Required fields: medicine_name (required), price (required)
-2. Optional fields: categroy, manufacturer, description_text
-3. Step 0: FIRST check if medicine already exists: SELECT medicine_id FROM medicines WHERE medicine_name LIKE '%<n>%'
-4. If medicine exists → STOP and inform user: "Medicine '<n>' already exists with ID <id>. Cannot add duplicate."
-5. If medicine does NOT exist → proceed:
-   - INSERT INTO medicines (medicine_name, price, category, manufacturer, description_text) VALUES (...)
-   - Get the medicine_id from result
-6. Confirm: "Medicine '<n>' added successfully with ID <id>."
+2. ORDER QUERIES:
+   - "Show pending orders" → SELECT o.order_id, m.medicine_name, o.quantity, o.customer_name, o.phone, o.status, o.created_at FROM orders o JOIN medicines m ON o.medicine_id = m.medicine_id WHERE o.status = 'Pending' ORDER BY o.created_at DESC
+   - "Find order #123" → SELECT o.order_id, m.medicine_name, o.quantity, o.total_price, o.customer_name, o.address, o.status FROM orders o JOIN medicines m ON o.medicine_id = m.medicine_id WHERE o.order_id = 123
+   - "Show orders for customer name 'John'" → SELECT o.order_id, m.medicine_name, o.quantity, o.total_price, o.status FROM orders o JOIN medicines m ON o.medicine_id = m.medicine_id WHERE o.customer_name LIKE '%John%'
+   - "Show delivered orders this month" → SELECT o.order_id, m.medicine_name, o.customer_name, o.delivery_date FROM orders o JOIN medicines m ON o.medicine_id = m.medicine_id WHERE o.status = 'Delivered' AND MONTH(o.created_at) = MONTH(CURDATE())
+   - "How many orders are processing?" → SELECT COUNT(*) as processing_count FROM orders WHERE status = 'Processing'
 
-ADDING MEDICINE WITH INVENTORY (Both Together):
-1. Required fields: medicine_name (required), price (required), quantity (required)
-2. Optional fields: categroy, manufacturer, description_text, batch_number, expiry_date
-3. Step 0: FIRST check if medicine already exists: SELECT medicine_id FROM medicines WHERE medicine_name LIKE '%<n>%'
-4. If medicine exists → STOP and inform user: "Medicine '<n>' already exists with ID <id>. Use 'update inventory' to add stock."
-5. If medicine does NOT exist → proceed:
-   - Step 1: INSERT INTO medicines (medicine_name, price, category, manufacturer, description_text) VALUES (...)
-   - Step 2: Get the medicine_id from the result
-   - Step 3: INSERT INTO inventory (medicine_id, quantity, batch_number, expiry_date) VALUES (<medicine_id>, <qty>, <batch>, <date>)
-6. Confirm: "Medicine '<n>' added successfully with <qty> units in stock."
+3. SALES/REVENUE QUERIES:
+   - "Total revenue from delivered orders" → SELECT SUM(total_price) as total_revenue FROM orders WHERE status = 'Delivered'
+   - "Top selling medicines" → SELECT m.medicine_name, SUM(o.quantity) as total_sold, SUM(o.total_price) as revenue FROM orders o JOIN medicines m ON o.medicine_id = m.medicine_id WHERE o.status = 'Delivered' GROUP BY m.medicine_name ORDER BY total_sold DESC LIMIT 10
 
-ADDING INVENTORY (For Existing Medicine):
-1. User says "add inventory for <n>" or "add stock for <n>"
-2. Required: medicine_name, quantity
-3. Step 1: Verify medicine exists: SELECT medicine_id FROM medicines WHERE medicine_name LIKE '%<n>%'
-4. If medicine NOT found → STOP and inform: "Medicine '<n>' not found. Please add medicine first."
-5. If medicine found → check if inventory already exists: SELECT inventory_id FROM inventory WHERE medicine_id = <id>
-6. If inventory exists → UPDATE inventory SET quantity = quantity + <qty> WHERE medicine_id = <id>
-7. If inventory does NOT exist → INSERT INTO inventory (medicine_id, quantity, batch_number, expiry_date) VALUES (<id>, <qty>, <batch>, <date>)
-8. Confirm with new total quantity
+ADDING/UPDATING MEDICINES:
+1. New medicine: "Add Aspirin with price 50" or similar
+   - Step 1: Check if exists: SELECT medicine_id FROM medicines WHERE medicine_name LIKE '%Aspirin%'
+   - Step 2: If not exists, INSERT INTO medicines (medicine_name, quantity, price, category, manufacturer, description, expiry_date) VALUES (...)
+   - Confirm: "Medicine 'X' added successfully with ID Y"
 
-UPDATING INVENTORY:
-When user says "set quantity to X" or "update stock to X":
-→ UPDATE inventory SET quantity = <new_qty> WHERE medicine_id = (SELECT medicine_id FROM medicines WHERE medicine_name LIKE '%X%')
+2. Update quantity: "Update stock of Paracetamol to 100" or "Add 50 units of Aspirin"
+   - For SET: UPDATE medicines SET quantity = 100 WHERE medicine_name LIKE '%Paracetamol%'
+   - For ADD: UPDATE medicines SET quantity = quantity + 50 WHERE medicine_name LIKE '%Aspirin%'
+   - After update, SELECT to confirm new quantity
 
-When user says "add X more" or "X more units added" or "increase by X":
-→ UPDATE inventory SET quantity = quantity + <added_qty> WHERE medicine_id = (SELECT medicine_id FROM medicines WHERE medicine_name LIKE '%X%')
+PROCESSING ORDERS:
+1. Update order status: "Mark order #123 as Delivered" or "Order #456 is Processing"
+   - UPDATE orders SET status = 'Delivered', delivery_date = CURDATE() WHERE order_id = 123
+   - For Processing: UPDATE orders SET status = 'Processing' WHERE order_id = 456
+   - Confirm with SELECT of updated order
 
-When user says "remove X" or "subtract X" or "reduce by X":
-→ UPDATE inventory SET quantity = quantity - <removed_qty> WHERE medicine_id = (SELECT medicine_id FROM medicines WHERE medicine_name LIKE '%X%')
-
-IMPORTANT: 
-• "50 more added" means quantity = quantity + 50 (NOT quantity = 50)
-• "reduce by 20" means quantity = quantity - 20 (NOT quantity = 20)
-• After update, SELECT the new quantity to confirm
-
-RECORDING SALES:
-1. Verify medicine exists: SELECT medicine_id, price FROM medicines WHERE medicine_name LIKE '%X%'
-2. Check current stock: SELECT quantity FROM inventory WHERE medicine_id = <id>
-3. If quantity < quantity_sold → warn user with available stock and STOP
-4. Use price from medicines table as price_per_unit (unless user specifies different price)
-5. Calculate: total_price = quantity_sold × price_per_unit
-6. INSERT INTO sales (medicine_id, quantity_sold, price_per_unit, total_price, sale_date) VALUES (<id>, <qty>, <price>, <total>, NOW())
-7. UPDATE inventory SET quantity = quantity - <qty_sold> WHERE medicine_id = <id>
-8. Confirm: "Sale recorded. <qty> units of '<n>' sold for ₹<total>. Remaining stock: <new_qty> units."
+2. Check order details before shipping: "Show order #789 details"
+   - SELECT o.order_id, m.medicine_name, o.quantity, o.customer_name, o.phone, o.address, o.city, o.pincode FROM orders o JOIN medicines m ON o.medicine_id = m.medicine_id WHERE o.order_id = 789
 
 VALIDATION:
-• Prices must be positive integers
+• Prices must be positive numbers
 • Quantities must be positive integers
-• Verify medicine_id exists before inventory/sales operations
-• Check sufficient stock before recording sales (quantity >= quantity_sold)
-• Verify total_price = quantity_sold × price_per_unit
+• Order status must be one of: 'Pending', 'Processing', 'Delivered', 'Cancelled'
+• Always verify medicine_id exists before order operations
 • Use actual tool results - never fabricate data
 
-MEDICINE INFORMATION:
-If asked about medicine usage/effects: 
-• Provide educational information only (common uses, general precautions)
-• Format in simple bullet points
-• NO dosage instructions, NO diagnosis, NO treatment recommendations
-• Always end with: "⚠️ Please consult a healthcare professional for medical advice."
-
 ERROR HANDLING:
-• If query fails, explain the error clearly in simple terms
+• If query fails, explain the error clearly
 • If required data is missing, ask specific questions
-• If inventory insufficient, show available quantity
+• If medicine/order not found, inform staff clearly
 • Never guess values - always verify with database tools
-• If tool returns empty result, inform user clearly
+• Show available options if search returns no results
 
 RESPONSE FORMAT:
 • Present results in clear, natural language
-• Use tables or bullet points for multiple items
-• Always show medicine_name, not just medicine_id
+• Use tables or formatted lists for multiple items
+• Always show medicine_name and customer details where relevant
 • Be concise but complete
-• Don't show SQL queries unless user asks
-• Don't mention tool names or technical details"""
+• Don't show SQL queries unless staff asks
+• For numeric results, format currency with ₹ symbol
+• Include record counts in your summary"""
 
-from langchain_core.messages import SystemMessage
 
+# ================ CHAT NODE ================
 def chat_node(state: ChatState):
     messages = state["messages"]
+    user_id = state.get("user_id")
 
-    # Inject system prompt ONCE
     if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(SYSTEM_PROMPT)] + messages
+        user_context = f"\nCurrent User ID: {user_id}" if user_id else ""
+        system_msg = SystemMessage(SYSTEM_PROMPT + user_context)
+        messages = [system_msg] + messages
 
-    # Invoke LLM with tools
     response = llm_with_tools.invoke(messages)
-    return {
-        "messages": [response]
-    }
+    return {"messages": [response]}
 
-
-
-
-
+# ================ TOOL NODE ================
 def tool_node(state: ChatState):
-    last_message = state["messages"][-1]
-    tool_calls = getattr(last_message, "tool_calls", None)
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None)
 
     if not tool_calls:
         return {}
 
-    results = []
+    tool_messages = []
     for call in tool_calls:
-        name = call["name"]
-        args = call["args"]
-
-        output = tools_by_name[name].invoke(args)
-
-        results.append(
-            ToolMessage(
-                content=str(output),
-                tool_call_id=call["id"]
+        try:
+            output = tools_by_name[call["name"]].invoke(call["args"])
+            tool_messages.append(
+                ToolMessage(
+                    content=str(output),
+                    tool_call_id=call["id"]
+                )
             )
-        )
+        except Exception as e:
+            tool_messages.append(
+                ToolMessage(
+                    content=f"Error executing tool: {str(e)}",
+                    tool_call_id=call["id"]
+                )
+            )
 
-    return {"messages": results}
+    return {"messages": tool_messages}
 
+# ================ GRAPH FORMATTER ================
+def graph_formatter_node(state: ChatState):
+    last = state["messages"][-1]
 
+    try:
+        rows = eval(last.content)
+    except Exception:
+        return {}
 
+    data = [{"period": str(r[0]), "value": float(r[1])} for r in rows]
+
+    return {
+        "action_type": "timeseries_graph",
+        "action_payload": {
+            "title": "Sales Trend",
+            "granularity": "monthly",
+            "data": data
+        }
+    }
+
+# ================ ROUTER ================
 def should_continue(state: ChatState):
-    last_message = state["messages"][-1]
-    tool_calls = getattr(last_message, "tool_calls", None)
+    last = state["messages"][-1]
 
-    if tool_calls:
+    if getattr(last, "tool_calls", None):
         return "toolnode"
+
+    if isinstance(last, ToolMessage):
+        return "graphnode"
+
     return END
 
+# ================ GRAPH ================
+conn = sqlite3.connect("chatbot.db", check_same_thread=False)
+checkpointer = SqliteSaver(conn)
 
-conn=sqlite3.connect("chatbot.db",check_same_thread=False)
-checkpointer=SqliteSaver(conn=conn)
+graph = StateGraph(ChatState)
+graph.add_node("chatnode", chat_node)
+graph.add_node("toolnode", tool_node)
+graph.add_node("graphnode", graph_formatter_node)
 
-graph=StateGraph(ChatState)
-graph.add_node("chatnode",chat_node)
-graph.add_node("toolnode",tool_node)
-graph.add_edge(START,"chatnode")
+graph.add_edge(START, "chatnode")
 graph.add_conditional_edges(
     "chatnode",
     should_continue,
-    ["toolnode",END]
+    ["toolnode", "graphnode", END]
 )
-graph.add_edge("toolnode","chatnode")
-chatbot=graph.compile(checkpointer=checkpointer)
+graph.add_edge("toolnode", "chatnode")
+graph.add_edge("graphnode", END)
 
+chatbot = graph.compile(checkpointer=checkpointer)
+
+# ================ THREAD LIST ================
 def retrieve_all_threads():
-    res=set()
+    res = set()
     for checkpoint in checkpointer.list(None):
         res.add(checkpoint.config["configurable"]["thread_id"])
     return list(res)
-
-
-
-    
-
-
-
-
-
-
