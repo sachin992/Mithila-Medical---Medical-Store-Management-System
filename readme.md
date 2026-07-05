@@ -79,6 +79,22 @@ OPENAI_TIMEOUT_SECONDS=30
 +-- requirements.txt
 ```
 
+## Screenshots
+### Login
+![Login](docs/LOGIN.png)
+
+### User Search
+![User Search](docs/USER_Page.png)
+
+### Cart
+![Cart](docs/CART_Page.png)
+
+### Orders
+![Orders](docs/ORDER_Page.png)
+
+### Admin Chatbot
+![Admin Chatbot](docs/ADMIN_CHATBOT_Page.png)
+
 ## Notes
 - Legacy Streamlit code has been removed from this workspace because it is no longer used by the active stack.
 - Root `requirements.txt` delegates to backend dependencies.
