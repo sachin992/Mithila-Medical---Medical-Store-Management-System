@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+.venv/
+
+# Node
+node_modules/
+frontend_react/dist/
+
+# Environment
+.env
+backend_fastapi/.env
+frontend_react/.env
+
+# IDE/OS
+.vscode/
+.DS_Store
+Thumbs.db
